@@ -2,10 +2,12 @@
 
 抓取流程：
 1. 从目录列表页出发，沿"下一页"链接在同站内翻页（去重、限页数）；
-2. 收集列表中的详情链接，同一详情 URL 跨页重复出现只计一次；
-3. 按型号筛选匹配的详情页并抓取，解析每包片数、含税包价、可购包数；
-4. 匹配到的详情页抓取或解析失败时记录到 failed_details（调用方据此
-   不给出确定最低价）。
+2. 每页合并所有详情链接选择器（a.product-link / li.product-item a[href] 等），
+   同一详情 URL 跨页重复出现只计一次；
+3. 列表文案含目标型号的链接，以及文案未标型号（如"查看规格"）而需要核对
+   详情页的链接，均抓取详情并以详情页型号为准核对；
+4. 待核对的详情页抓取或解析失败时，记录失败地址（调用方据此不给出确定
+   最低价）；详情页确认是其他型号的，不计入匹配结果。
 """
 from __future__ import annotations
 
@@ -21,7 +23,7 @@ MAX_PAGES = 50          # 分页抓取上限，防止死循环或异常站点
 REQUEST_TIMEOUT = 10    # 单次请求超时（秒）
 USER_AGENT = "membrane-procurement-bot/1.0"
 
-# 列表页中详情链接的 CSS 选择器，按优先级依次尝试
+# 列表页中详情链接的 CSS 选择器；同一页可能混用多种写法，需全部合并
 PRODUCT_LINK_SELECTORS = [
     "a.product-link",
     "li.product-item a[href]",
@@ -29,6 +31,8 @@ PRODUCT_LINK_SELECTORS = [
 ]
 NEXT_TEXT_RE = re.compile(r"(下一页|下页|next|»|›)", re.I)
 NUM_RE = re.compile(r"([\d,]+(?:\.\d+)?)")
+# 列表文案中的型号样式（如 X-10、MF50、BROKEN-1）；用于识别"其他型号"条目
+MODEL_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*[-_.]?[0-9]+")
 
 
 class ScrapeError(Exception):
@@ -51,9 +55,9 @@ class OfferInfo:
 class CrawlResult:
     list_pages: list[str]           # 实际抓取到的列表页 URL（按顺序）
     matched: list[OfferInfo]        # 匹配型号且解析成功的详情
-    failed_details: list[str]       # 匹配但抓取/解析失败的详情 URL
+    failed_details: list[str]       # 列表文案已含目标型号、但抓取/解析失败的详情 URL
     duplicate_details: int          # 跨页重复出现被跳过的详情链接数
-    unverified_failed: list[str]    # 兜底扫描时无法抓取、未能核对型号的详情 URL
+    unverified_failed: list[str]    # 文案未标型号、待核对但抓取/解析失败的详情 URL
 
 
 def normalize_model(text: str) -> str:
@@ -80,11 +84,32 @@ def _get_soup(session: requests.Session, url: str) -> BeautifulSoup:
 
 
 def _product_links(soup: BeautifulSoup):
+    """合并所有详情链接选择器的结果（同一页可能混用多种链接写法）。
+
+    同一 <a> 可能被多个选择器命中，按 DOM 对象身份去重，避免把同页同一
+    链接误算成"跨页重复"。
+    """
+    links = []
+    seen_ids: set[int] = set()
     for sel in PRODUCT_LINK_SELECTORS:
-        links = soup.select(sel)
-        if links:
-            return links
-    return []
+        for a in soup.select(sel):
+            if id(a) in seen_ids:
+                continue
+            seen_ids.add(id(a))
+            links.append(a)
+    return links
+
+
+def _mentions_other_model(text: str, target: str) -> bool:
+    """列表文案是否明确写了非目标型号。
+
+    文案不含目标且出现型号样式（如 X-10 / BROKEN-1）时，可在列表阶段
+    直接判定为其他型号，无需抓取详情；"查看规格"这类未标型号的文案
+    返回 False，必须抓取详情核对。
+    """
+    if target in normalize_model(text):
+        return False
+    return bool(MODEL_TOKEN_RE.search(text or ""))
 
 
 def _next_page_url(soup: BeautifulSoup, current_url: str, netloc: str):
@@ -196,6 +221,7 @@ def crawl_catalog(catalog_url: str, model: str) -> CrawlResult:
         seen_pages.add(url)
         soup = _get_soup(session, url)  # 列表页失败：整个目录不可用，直接抛错
         list_pages.append(url)
+        page_urls: set[str] = set()
         for a in _product_links(soup):
             href = a.get("href")
             if not href:
@@ -203,6 +229,9 @@ def crawl_catalog(catalog_url: str, model: str) -> CrawlResult:
             detail_url = _abs_url(href, url)
             if not _same_site(detail_url, netloc):
                 continue  # 只接受同站详情链接
+            if detail_url in page_urls:
+                continue  # 同页重复（含同一 <a> 被多个选择器命中）
+            page_urls.add(detail_url)
             if detail_url in seen_details:
                 duplicates += 1  # 同一详情跨页重复出现，只计一次
                 continue
@@ -210,29 +239,48 @@ def crawl_catalog(catalog_url: str, model: str) -> CrawlResult:
             entries.append((detail_url, a.get_text(" ", strip=True)))
         url = _next_page_url(soup, url, netloc)
 
-    # 先用列表文案匹配型号；若一个都匹配不上，退回逐个抓取详情页核对型号
-    matched_entries = [(u, t) for u, t in entries if target in normalize_model(t)]
-    fallback_scan = not matched_entries and bool(entries)
-    candidates = entries if fallback_scan else matched_entries
+    # 列表文案已含目标型号 → 必抓详情核对；
+    # 文案未标型号（如"查看规格"）→ 也可能命中，不能因为同页有带型号的
+    # 链接就跳过，需抓取详情核对；文案明确写了其他型号 → 不计入。
+    # 若所有文案都没出现目标型号，则退回全量核对（无法确定目标是否只在
+    # 详情页出现），此时无法核对的页面记为 unverified_failed。
+    text_matched = [(u, t) for u, t in entries if target in normalize_model(t)]
+    fallback_scan = not text_matched and bool(entries)
+    if fallback_scan:
+        candidates = entries
+    else:
+        candidates = [
+            (u, t)
+            for u, t in entries
+            if target in normalize_model(t) or not _mentions_other_model(t, target)
+        ]
 
     matched: list[OfferInfo] = []
     failed: list[str] = []
     unverified: list[str] = []
-    for detail_url, _text in candidates:
+    for detail_url, link_text in candidates:
+        confirmed_by_text = target in normalize_model(link_text)
         try:
             soup = _get_soup(session, detail_url)
             offer = parse_detail_page(detail_url, soup)
         except ScrapeError:
-            if fallback_scan:
-                # 兜底扫描时无法确认该页是否匹配，单独记录为"未能核对"
-                unverified.append(detail_url)
-            else:
+            if confirmed_by_text:
                 # 列表文案已确认匹配的详情抓取/解析失败：无法保证最低价确定性
                 failed.append(detail_url)
+            else:
+                # 文案未标型号、待核对但无法读取/解析：无法确认是否匹配
+                unverified.append(detail_url)
             continue
-        if target in normalize_model(offer.model) or target in normalize_model(offer.title):
+
+        detail_model = normalize_model(offer.model)
+        if detail_model:
+            is_match = target in detail_model
+        else:
+            # 详情页没有型号字段时，退回用标题核对
+            is_match = target in normalize_model(offer.title)
+        if is_match:
             matched.append(offer)
-        # 列表文案匹配但详情型号不符的，视为非目标商品，静默跳过
+        # 详情页确认是其他型号的，不计入匹配结果
 
     return CrawlResult(
         list_pages=list_pages,

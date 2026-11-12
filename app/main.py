@@ -7,7 +7,7 @@ POST /api/v1/quote
 状态语义：
   ok                  找到确定的最优组合
   insufficient_stock  库存总量不足，不给出确定最低价
-  scrape_failed       匹配详情页抓取/解析失败，不给出确定最低价
+  scrape_failed       匹配/待核对详情页抓取或解析失败，不给出确定最低价
   no_matching_products 目录中没有匹配型号的商品
   catalog_unreachable 目录列表页抓取失败
 """
@@ -60,13 +60,14 @@ def quote(req: QuoteRequest):
         "duplicate_detail_links_skipped": crawl.duplicate_details,
     }
 
-    # 匹配详情抓取失败：不给出确定的最低价
-    if crawl.failed_details:
+    # 匹配详情抓取失败，或待核对详情无法读取/解析：不给出确定的最低价
+    if crawl.failed_details or (crawl.matched and crawl.unverified_failed):
+        failed_pages = list(dict.fromkeys(crawl.failed_details + crawl.unverified_failed))
         return {
             **base,
             "status": "scrape_failed",
-            "message": "部分匹配详情页抓取或解析失败，无法给出确定的最低价",
-            "failed_detail_pages": crawl.failed_details,
+            "message": "部分详情页抓取或解析失败，无法核对型号或给出确定的最低价",
+            "failed_detail_pages": failed_pages,
             "solution": None,
         }
 
@@ -81,16 +82,6 @@ def quote(req: QuoteRequest):
             resp["message"] += "（另有部分详情页无法抓取，未能核对）"
             resp["unverified_failed_pages"] = crawl.unverified_failed
         return resp
-
-    # 兜底扫描时有详情页未能核对：可能漏掉更优的匹配，不给确定最低价
-    if crawl.unverified_failed:
-        return {
-            **base,
-            "status": "scrape_failed",
-            "message": "部分详情页无法抓取、未能核对是否还有更优匹配，无法给出确定的最低价",
-            "failed_detail_pages": crawl.unverified_failed,
-            "solution": None,
-        }
 
     offers = [Offer(o.pack_size, o.price_fen, o.stock_packs) for o in crawl.matched]
     total_available = sum(o.pack_size * o.stock_packs for o in offers)

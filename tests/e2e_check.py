@@ -99,6 +99,65 @@ def main():
     check("NY-66/150 状态 ok", d["status"] == "ok")
     check("总价 ¥360.00", d["solution"]["total_price"] == "360.00")
 
+    # 8b) X-10 分页混合选择器：第 2 页混用 a.product-link 与 li.product-item a[href]，
+    #     含重复的 50 片装链接和未标型号（"查看规格"）的 100 片装链接。
+    #     需求 100 片 → 1 包 100 片装 ¥150，而不是 2 包 50 片装 ¥240。
+    x10_catalog = f"{base}/x10/index.html"
+    r = client.post("/api/v1/quote", json={"catalog_url": x10_catalog, "model": "X-10", "demand": 100})
+    d = r.json()
+    check("X-10/100 状态 ok", d["status"] == "ok")
+    check("X-10/100 总价 ¥150.00（未误报 ¥240）", d["solution"]["total_price"] == "150.00")
+    check("X-10/100 实到 100 片", d["solution"]["total_pieces"] == 100)
+    check(
+        "X-10/100 选择 100 片装 ×1",
+        len(d["solution"]["items"]) == 1
+        and d["solution"]["items"][0]["pack_size"] == 100
+        and d["solution"]["items"][0]["purchased_packs"] == 1,
+    )
+    check("X-10 抓取 2 个列表页", len(d["list_pages"]) == 2, str(d["list_pages"]))
+    check("X-10 跨页重复跳过 1 次", d["duplicate_detail_links_skipped"] == 1)
+    check("X-10 匹配 2 个详情（重复只计一次）", len(d["matched_detail_pages"]) == 2)
+    check(
+        "未标型号的 100 片装详情被采集",
+        any(u.endswith("/details/x10-100.html") for u in d["matched_detail_pages"]),
+    )
+
+    # 8c) 未标型号详情核对后确认是其他型号 → 不计入匹配结果
+    r = client.post(
+        "/api/v1/quote",
+        json={"catalog_url": f"{base}/x10/verify-other-model.html", "model": "X-10", "demand": 50},
+    )
+    d = r.json()
+    check("X-10 核对其他型号后状态 ok", d["status"] == "ok")
+    check("仅 X-10 50 片装被计入，总价 ¥120.00", d["solution"]["total_price"] == "120.00")
+    check("NY-66 详情不计入匹配结果", len(d["matched_detail_pages"]) == 1)
+
+    # 8d) 待核对的未标型号详情 404 → 返回失败地址，不给确定报价
+    r = client.post(
+        "/api/v1/quote",
+        json={"catalog_url": f"{base}/x10/verify-404.html", "model": "X-10", "demand": 50},
+    )
+    d = r.json()
+    check("待核对详情 404 → scrape_failed", d["status"] == "scrape_failed")
+    check("404 无方案", d["solution"] is None)
+    check(
+        "404 返回失败地址",
+        any(u.endswith("/details/x10-missing.html") for u in d.get("failed_detail_pages", [])),
+    )
+
+    # 8e) 待核对的未标型号详情无法解析 → 返回失败地址，不给确定报价
+    r = client.post(
+        "/api/v1/quote",
+        json={"catalog_url": f"{base}/x10/verify-malformed.html", "model": "X-10", "demand": 50},
+    )
+    d = r.json()
+    check("待核对详情解析失败 → scrape_failed", d["status"] == "scrape_failed")
+    check("解析失败无方案", d["solution"] is None)
+    check(
+        "解析失败返回失败地址",
+        any(u.endswith("/details/x10-malformed.html") for u in d.get("failed_detail_pages", [])),
+    )
+
     # 9) 目录不可达
     r = client.post("/api/v1/quote", json={"catalog_url": f"{base}/no-such-page.html", "model": "MF-50", "demand": 10})
     d = r.json()
